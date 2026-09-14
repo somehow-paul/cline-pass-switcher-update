@@ -953,3 +953,8 @@ server.listen(config.port, BIND_HOST, () => {
   console.log(`Cline Pass 上游控制台:  http://127.0.0.1:${config.port}/`);
   console.log(`OpenAI 兼容代理地址:   http://127.0.0.1:${config.port}/v1`);
 });
+
+// 进程级兜底：代理是常驻服务，任何未捕获异常/未处理拒绝只记录日志，不退出进程。
+// 历史故障：单条流式请求的上游 body 中断触发 unhandled 'error'，把整个代理带走。
+process.on('uncaughtException', (e) => console.error('[未捕获异常]', e));
+process.on('unhandledRejection', (e) => console.error('[未处理拒绝]', e));
