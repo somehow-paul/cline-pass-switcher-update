@@ -613,7 +613,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
               const rest = await up.text().catch(() => '');
               text = firstChunk.toString('utf8') + rest;
             } else {
-              text = await up.text();
+              text = await up.text().catch(() => '');
             }
             try { json = JSON.parse(text); } catch {}
             const msg = errText(json?.error) || text.slice(0, 160) || netError;
@@ -708,7 +708,22 @@ async function handleChat(req, res) {
         cb();
       },
     });
-    Readable.fromWeb(up.body).pipe(tap).pipe(res);
+    // 上游 body 出错必须就地消化：pipe() 只转发数据、不转发 error，
+    // 未被监听的 'error' 事件会被 Node 升级成未捕获异常，直接终止整个进程。
+    // 实测两种触发源：上游/本地代理断链（UND_ERR_SOCKET），以及 undici 默认 bodyTimeout（300s 无数据）。
+    const src = Readable.fromWeb(up.body);
+    src.on('error', (e) => {
+      record(modelId, {
+        provider: null, canonical: null, ms: Date.now() - t0, stream: true,
+        error: `stream aborted: ${e.message}`, account: acc.name,
+        attempts: chain.trace.map((t) => t.upstream || 'auto'),
+      });
+      try { res.destroy(); } catch {}
+    });
+    // 下游（客户端）中断会让 res 抛 error / close，一并把上游 body 收掉，避免悬挂连接
+    res.on('error', () => { try { src.destroy(); } catch {} });
+    res.on('close', () => { try { src.destroy(); } catch {} });
+    src.pipe(tap).pipe(res);
     return;
   }
 
