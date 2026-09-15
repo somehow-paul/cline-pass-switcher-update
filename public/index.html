@@ -46,6 +46,17 @@
   @keyframes r { to { transform: rotate(360deg); } }
   .empty { color: var(--dim); font-size: 13px; padding: 14px 10px; }
   .match { color: var(--green); } .mismatch { color: var(--orange); }
+  /* 额度列：5小时/本周/本月 三条滚动窗口迷你进度条（数据来自 Cline 账单接口，纯查询不计费） */
+  .qwin { display: flex; align-items: center; gap: 6px; font-size: 11.5px; line-height: 1.6; white-space: nowrap; }
+  .qwin .qlab { flex: none; width: 34px; color: var(--dim); }
+  .qbar { flex: none; width: 62px; height: 6px; background: #2a2f3a; border-radius: 3px; overflow: hidden; }
+  .qbar > i { display: block; height: 100%; border-radius: 3px; background: var(--green); }
+  .qbar > i.mid { background: var(--orange); }
+  .qbar > i.hi { background: var(--red); }
+  .qwin .qpct { flex: none; width: 32px; text-align: right; font-family: Consolas, monospace; color: var(--text); }
+  .qwin .qreset { flex: none; color: var(--dim); font-size: 11px; }
+  .qerr { color: var(--red); font-size: 11.5px; }
+  .qplan { color: var(--dim); font-size: 11px; margin-top: 4px; }
   tr.row-new td { animation: newflash 4s ease-out; }
   @keyframes newflash { 0% { background: #1f3d2a; } 70% { background: #1f3d2a; } 100% { background: transparent; } }
   /* 上游优先级/排除面板 */
@@ -133,11 +144,13 @@
       <label class="dim" style="font-size:12px"><input type="checkbox" id="accShowKeys" onchange="toggleKeyVis()"> 显示密钥</label>
       <button class="ghost" onclick="addAccountRow()">＋ 添加账号</button>
       <button onclick="saveAccounts()">保存账号配置</button>
+      <button class="ghost" onclick="refreshQuota()" id="quotaBtn">↻ 刷新额度</button>
       <span class="dim" style="font-size:12px" id="accMsg"></span>
+      <span class="dim" style="font-size:12px" id="quotaMsg"></span>
     </div>
     <table>
-      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
-      <tbody id="accBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
+      <thead><tr><th>使用</th><th>名称</th><th>API Key</th><th>启用</th><th>额度（5小时 / 本周 / 本月）</th><th>请求数</th><th>最近使用</th><th>操作</th></tr></thead>
+      <tbody id="accBody"><tr><td colspan="8" class="empty">加载中…</td></tr></tbody>
     </table>
   </div>
 
@@ -382,6 +395,11 @@ async function loadAll() {
   renderAccounts();
   renderSecurity(sec);
   $('#noKeyBanner').style.display = meta.configured ? 'none' : 'block';
+  // 额度走异步补渲染：不阻塞首屏；若用户已经在账号表里输入，则跳过这次重渲染以免顶掉正在编辑的内容
+  loadQuota(false).then(() => {
+    const el = document.activeElement;
+    if (!el || typeof el.closest !== 'function' || !el.closest('#accBody')) renderAccounts();
+  });
 }
 
 function renderSecurity(sec) {
@@ -667,6 +685,70 @@ async function loadHistory() {
 let ACCS = null;
 const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+// ---- 额度（订阅滚动窗口用量）----
+// 数据来自后端 /api/quota（转发 Cline 账单接口）；按「账号名」对齐，
+// 避免增删行（未保存）时按下标错位显示成别的账号的额度。
+let QUOTA = null;
+const QUOTA_LABELS = { five_hour: '5小时', weekly: '本周', monthly: '本月' };
+
+function fmtReset(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function renderQuotaCell(name, i) {
+  if (!QUOTA) return '<span class="dim">—</span>';
+  const q = QUOTA.accounts.find((a) => a.name === name) || QUOTA.accounts[i];
+  if (!q) return '<span class="dim">—</span>';
+  if (!q.ok) return `<span class="qerr" title="${escapeHtml(q.error || '读取失败')}">读取失败</span>`;
+  const rows = (q.windows || []).map((w) => {
+    const known = w.percent !== null && w.percent !== undefined;
+    const pct = known ? Math.max(0, Math.min(100, w.percent)) : 0;
+    const cls = pct >= 80 ? 'hi' : pct >= 50 ? 'mid' : '';
+    const label = w.label || QUOTA_LABELS[w.type] || w.type;
+    const cap = (w.limitUsd === null || w.limitUsd === undefined) ? '上限未知' : `上限 $${w.limitUsd}`;
+    const tip = `${label}：已用 ${known ? w.percent + '%' : '未知'}（${cap}${w.resetsAt ? '，重置 ' + fmtReset(w.resetsAt) : ''}）`;
+    return `<div class="qwin" title="${escapeHtml(tip)}">
+      <span class="qlab">${escapeHtml(label)}</span>
+      <span class="qbar"><i class="${cls}" style="width:${pct}%"></i></span>
+      <span class="qpct">${known ? w.percent + '%' : '—'}</span>
+      <span class="qreset">${w.resetsAt ? fmtReset(w.resetsAt) : ''}</span>
+    </div>`;
+  }).join('');
+  const planParts = [];
+  if (q.periodStart) planParts.push(`当期 ${fmtReset(q.periodStart)} 起`);
+  if (q.periodEnd) planParts.push(`${fmtReset(q.periodEnd)} 到期`);
+  if (q.cancelAt) planParts.push('到期后不续费');
+  const plan = q.planName
+    ? `<div class="qplan" title="${escapeHtml(planParts.join('，'))}">${escapeHtml(q.planName)}${q.cancelAt ? ' · 到期不续费' : ''}${q.planActive === false ? ' · 已失效' : ''}</div>`
+    : '';
+  return rows + plan;
+}
+
+async function loadQuota(force) {
+  try {
+    QUOTA = await api(`/api/quota${force ? '?refresh=1' : ''}`);
+  } catch (e) {
+    QUOTA = null;
+  }
+  const el = $('#quotaMsg');
+  if (el) el.textContent = QUOTA?.fetchedAt ? `额度更新于 ${fmt(QUOTA.fetchedAt)}` : '';
+}
+
+async function refreshQuota() {
+  const btn = $('#quotaBtn');
+  btn.disabled = true; btn.textContent = '↻ 刷新中…';
+  try {
+    await loadQuota(true);
+    renderAccounts();
+  } finally {
+    btn.disabled = false; btn.textContent = '↻ 刷新额度';
+  }
+}
+
 function renderAccounts() {
   if (!ACCS) return;
   $('#accMode').value = ACCS.mode;
@@ -679,6 +761,7 @@ function renderAccounts() {
       <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:110px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
       <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:100%; min-width:280px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
       <td><input type="checkbox" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
+      <td>${renderQuotaCell(a.name, i)}</td>
       <td>${st.requests ?? 0}${st.lastError ? '<div class="mismatch" style="font-size:11px">最近有错误</div>' : ''}</td>
       <td class="dim" style="font-size:12px">${st.lastUsed ? fmt(st.lastUsed) : '—'}</td>
       <td><div class="row-actions">
@@ -687,7 +770,7 @@ function renderAccounts() {
       </div></td>
     </tr>`;
   }).join('');
-  $('#accBody').innerHTML = rows || '<tr><td colspan="7" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
+  $('#accBody').innerHTML = rows || '<tr><td colspan="8" class="empty">暂无账号，点击「＋ 添加账号」</td></tr>';
 }
 
 // 把 DOM 里当前编辑值收回 ACCS（避免重渲染丢输入）

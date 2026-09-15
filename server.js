@@ -770,6 +770,77 @@ async function catalog() {
   return META.catalog || [];
 }
 
+// ---------- 订阅额度（Cline Pass 滚动窗口用量） ----------
+// Cline 官方账单接口，sk_ 开头的 API Key 可直接鉴权（无需 OAuth 登录）：
+//   GET /users/me/plan/usage-limits → limits[] = { type: five_hour|weekly|monthly, percentUsed, resetsAt }
+//   GET /users/me/plan              → 套餐名、当期起止、上限阈值 entitlements.cline_pass.inferenceCapThreshold
+// 这两条都是纯账单查询：不触发推理、不消耗额度、不计费（与「探测/测试/校验」完全不同）。
+// 金额单位：costUsd 与阈值同为 1e-8 美元（对 /usages 明细做最小二乘拟合验证：
+// 未缓存输入 $0.15/M、缓存 $0.003/M、输出 $0.60/M，比例符合标准价目形态）。
+const QUOTA_TTL_MS = 60e3;
+const MU_PER_USD = 1e8;
+const QUOTA_WINDOWS = [
+  ['five_hour', '5小时', 'last5HoursUsageCostUSDPerUser'],
+  ['weekly', '本周', 'last7daysUsageCostUSDPerUser'],
+  ['monthly', '本月', 'last30daysUsageCostUSDPerUser'],
+];
+
+async function fetchAccountQuota(key) {
+  const headers = chatHeaders(key);
+  const [lim, plan] = await Promise.all([
+    fetchJSON(`${config.upstreamBase}/users/me/plan/usage-limits`, { headers }, 15000),
+    fetchJSON(`${config.upstreamBase}/users/me/plan`, { headers }, 15000),
+  ]);
+  if (lim.status !== 200 || !Array.isArray(lim.json?.data?.limits)) {
+    const raw = lim.json?.error?.message || lim.json?.error || `HTTP ${lim.status}`;
+    return { ok: false, error: String(typeof raw === 'string' ? raw : JSON.stringify(raw)).slice(0, 200) };
+  }
+  const byType = {};
+  for (const it of lim.json.data.limits) if (it && it.type) byType[it.type] = it;
+  const planData = plan.status === 200 ? plan.json?.data : null;
+  const cap = planData?.plan?.entitlements?.cline_pass?.inferenceCapThreshold || {};
+  // 注意 Number(null)===0、Number('')===0，会把「没有这个字段」误判成 0，先挡掉空值
+  const num = (v) => (v === null || v === undefined || v === '' ? null : (Number.isFinite(Number(v)) ? Number(v) : null));
+  return {
+    ok: true,
+    planName: planData?.plan?.displayName || null,
+    planActive: planData?.plan?.isActive ?? null,
+    periodStart: planData?.currentPeriodStart || null,
+    periodEnd: planData?.currentPeriodEnd || null,
+    cancelAt: planData?.cancelAt || null,   // 非空 = 当期结束后不再续费
+    windows: QUOTA_WINDOWS.map(([type, label, capKey]) => {
+      const w = byType[type] || {};
+      const capMu = num(cap[capKey]);
+      return {
+        type,
+        label,
+        percent: num(w.percentUsed),
+        resetsAt: w.resetsAt || null,
+        limitUsd: capMu === null ? null : +(capMu / MU_PER_USD).toFixed(2),
+      };
+    }),
+  };
+}
+
+// 逐账号按 key 查自己的额度（/users/me/* 是「key 所属账号」，多账号必须逐把查），带 TTL 缓存
+let quotaCache = { at: 0, accounts: [] };
+async function quotaSnapshot({ force = false } = {}) {
+  if (!force && quotaCache.accounts.length && Date.now() - quotaCache.at < QUOTA_TTL_MS) return quotaCache;
+  const list = config.accounts || [];
+  const accounts = await Promise.all(list.map(async (a, i) => {
+    const name = a?.name || `账号${i + 1}`;
+    const enabled = a?.enabled !== false;
+    if (!a?.key) return { name, enabled, ok: false, error: '未配置 key' };
+    try {
+      return { name, enabled, ...(await fetchAccountQuota(a.key)) };
+    } catch (e) {
+      return { name, enabled, ok: false, error: String(e?.message || e).slice(0, 200) };
+    }
+  }));
+  quotaCache = { at: Date.now(), accounts };
+  return quotaCache;
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://x');
   const p = url.pathname;
@@ -839,6 +910,11 @@ const server = http.createServer(async (req, res) => {
         stats: META.stats || {},
       });
     }
+    if (req.method === 'GET' && p === '/api/quota') {
+      // refresh=1 跳过缓存（页面上的「刷新额度」按钮走这条）
+      const snap = await quotaSnapshot({ force: url.searchParams.get('refresh') === '1' });
+      return sendJSON(res, 200, { fetchedAt: snap.at, accounts: snap.accounts });
+    }
     if (req.method === 'POST' && p === '/api/accounts') {
       const body = JSON.parse(await readBody(req).then((b) => b.toString()));
       const accs = (Array.isArray(body.accounts) ? body.accounts : [])
@@ -854,6 +930,7 @@ const server = http.createServer(async (req, res) => {
       config.activeAccount = Math.min(Math.max(0, Number(body.active) || 0), accs.length - 1);
       saveConfig();
       RR_COUNTER = 0;
+      quotaCache = { at: 0, accounts: [] };   // 账号池变了，额度缓存作废（否则会串号）
       return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, mode: config.accountMode, active: config.activeAccount });
     }
     if (req.method === 'POST' && p === '/api/accounts/test') {
