@@ -202,7 +202,10 @@
   </div>
 
   <div class="card">
-    <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
+    <div style="display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:12px">
+      <h2 style="margin:0">请求历史（最近 100 条，经代理的请求自动记录）</h2>
+      <button class="ghost" onclick="refreshHistory()" id="histBtn">↻ 刷新</button>
+    </div>
     <table>
       <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
       <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
@@ -666,6 +669,17 @@ function bulkUp(id, action) {
     s.config.upstreams = []; s.config.exclude = [];
     updateRowUi(id);
     saveModelCfg(id, { upstreams: [], exclude: [] });
+  }
+}
+
+// 请求历史的手动刷新：与「↻ 刷新额度」一致，刷新期间禁用按钮并改文案
+async function refreshHistory() {
+  const btn = $('#histBtn');
+  btn.disabled = true; btn.textContent = '↻ 刷新中…';
+  try {
+    await loadHistory();
+  } finally {
+    btn.disabled = false; btn.textContent = '↻ 刷新';
   }
 }
 
