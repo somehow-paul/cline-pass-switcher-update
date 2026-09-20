@@ -527,52 +527,86 @@ function buildAttempts(modelId, cfg) {
 // 把上游错误信息归一成短字符串（用于学习与尝试日志）
 const errText = (e) => (e == null ? '' : typeof e === 'string' ? e : JSON.stringify(e));
 
-// 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, acc }
+// 网络层失败的真实原因：undici 在 message 里只写一句笼统的 "fetch failed"，
+// 真正的起因挂在 e.cause 上（UND_ERR_CONNECT_TIMEOUT / UND_ERR_SOCKET / ECONNRESET / ENOTFOUND / CERT_* …）。
+// 不把 cause 一起记下来，"有些时候失败"就永远说不清是建连超时、被对端重置，还是 DNS/TLS 问题。
+// 被中止的情况（自身超时 / 客户端断开）我们 abort 时带了原因，e.message 本身就是那句原因。
+function netReason(e) {
+  const cause = e?.cause?.code || e?.cause?.message || '';
+  const msg = e?.message || String(e);
+  return cause && !String(msg).includes(cause) ? `${msg} (${cause})` : msg;
+}
+
+// 网络层失败的原地重试策略：只重试「一个可用的上游响应都没拿到」的情况（见 netFail）。
+// 实测这类失败（例如 UND_ERR_CONNECT_TIMEOUT）是瞬时的，隔几百毫秒重试基本必成；
+// 不重试的话每次抖动都会直接变成客户端的 502（表现为客户端自己「已重试模型请求 (1/5)」）。
+// 退避 250ms 起、800ms 封顶，带 ±40% 抖动，避免多个请求同时重试再次撞在一起。
+// 注意：自身超时中止 / 客户端断开中止都不算 netFail，绝不重试（否则一条请求会被拖成好几分钟）。
+const NET_RETRY_TIMES = 2;
+const NET_RETRY_BASE_MS = 250;
+const NET_RETRY_MAX_MS = 800;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function netRetryDelayMs(round) {
+  const d = Math.min(NET_RETRY_MAX_MS, NET_RETRY_BASE_MS * 2 ** round);
+  return Math.round(d * (0.6 + Math.random() * 0.8));
+}
+
+// 单次向上游网关发起非流式请求；返回 { status, out, routing, netError, netFail, acc }
 // 异常（网络错误/非 JSON/非 200）不抛出，由调用方决定切换
-async function attemptOnce(modelId, body, attempt, signal) {
+// acc 由调用方传入时不重新取号：同一候选的原地重试保持同一个账号。
+// netFail=true 专指「没拿到任何可用的上游响应」（fetch 直接抛错 / 响应不是 JSON）：
+// 这类才值得原地重试；拿到了 JSON 错误（例如 400/429）说明上游真的回答了，重试没有意义。
+async function attemptOnce(modelId, body, attempt, signal, acc = null) {
   const send = injectPrefs(body, modelId, attempt);
-  const acc = pickAccount();
+  acc = acc || pickAccount();
   try {
     const res = await fetch(`${config.upstreamBase}/chat/completions`, {
       method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal,
     });
     const json = await res.json().catch(() => null);
-    if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', acc };
+    if (!json) return { status: 502, out: { error: { message: 'upstream returned non-JSON', type: 'upstream_error' } }, routing: {}, netError: 'non-JSON response', netFail: true, acc };
     const { status, body: out, routing } = unwrap(json);
     return { status, out, routing, netError: null, acc };
   } catch (e) {
-    return { status: 502, out: { error: { message: `upstream fetch failed: ${e.message}`, type: 'upstream_error' } }, routing: {}, netError: e.message, acc };
+    const reason = netReason(e);
+    return { status: 502, out: { error: { message: `upstream fetch failed: ${reason}`, type: 'upstream_error' } }, routing: {}, netError: reason, netFail: true, acc };
   }
 }
 
 // 顺序故障转移：依次执行候选，非 200 / 网络失败 / 超时即切换下一个；全部失败返回最后一次结果。
 // 流式：首包前（网关以 JSON 而非 SSE 应答错误）仍可切换；SSE 一旦开始即透传，无法重试。
 // 每次尝试有独立的超时中止（attemptTimeoutMs）；客户端断开会中止当前尝试。
-// 返回 { status, out, routing, acc, trace, streamUp? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
-async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
+// 返回 { status, out, routing, acc, trace, streamUp?, netFail? } —— trace 为逐次尝试 [{ upstream, status, ms, note }]
+// 这是「跑一遍候选链」，网络层原地重试由下面的 runChatChain 包一层。
+async function runChatChainOnce(req, body, modelId, cfg, { stream = false, attemptTimeoutMs = 120000 } = {}) {
   const attempts = buildAttempts(modelId, cfg);
   const trace = [];
   const t0 = Date.now();
   let last = null;
+  let lastCtrl = null;              // 最后一次尝试的控制器：收尾时用它判断「这次失败是不是被我们自己中止的」
   let activeCtrl = null;            // 当前尝试的 AbortController；流式成功后保持指向该次 fetch，用于断连时中止上游 body
   let keepCloseHook = false;        // 流式 SSE 建立后，close 钩子要保留到流结束
-  const onClientClose = () => { if (activeCtrl) activeCtrl.abort(); };
+  // 中止时带上原因：日志/历史里才能区分「自身超时」和「客户端断开」，而不是笼统一句 aborted
+  const onClientClose = () => { if (activeCtrl) activeCtrl.abort(new Error('client closed')); };
   req.on('close', onClientClose);
   try {
     for (const attempt of attempts) {
       const t1 = Date.now();
       const ctrl = new AbortController();
       activeCtrl = ctrl;
-      const timer = setTimeout(() => ctrl.abort(), attemptTimeoutMs);
+      lastCtrl = ctrl;
+      const timer = setTimeout(() => ctrl.abort(new Error(`attempt timeout after ${attemptTimeoutMs}ms`)), attemptTimeoutMs);
+      // 同一候选（含其网络层原地重试）复用同一个账号：重试要解决的是线路抖动，不该顺手换号
+      const acc = pickAccount();
       try {
         if (stream) {
           const send = injectPrefs(body, modelId, attempt);
-          const acc = pickAccount();
           let up = null;
           let netError = null;
+          let netFail = false;      // 没拿到可用响应（fetch 抛错 / 空流 / 读不动）→ 值得原地重试
           try {
             up = await fetch(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(send), signal: ctrl.signal });
-          } catch (e) { netError = e.message; }
+          } catch (e) { netError = netReason(e); netFail = true; }
           const ctype = up?.headers?.get('content-type') || '';
           let isSSE = !!up && up.status === 200 && ctype.includes('event-stream');
           // 网关对流式错误可能返回 200 + text/event-stream，body 却是 {"error":...}：
@@ -586,6 +620,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
               if (done) {
                 isSSE = false;
                 netError = 'empty stream';
+                netFail = true;
               } else {
                 firstChunk = Buffer.from(value);
                 const head = firstChunk.toString('utf8').trimStart().slice(0, 200);
@@ -595,11 +630,13 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
                 } else {
                   isSSE = false;
                   netError = `unexpected stream head: ${head.slice(0, 60)}`;
+                  netFail = true;
                 }
               }
             } catch (e) {
               isSSE = false;
-              netError = e.message;
+              netError = netReason(e);
+              netFail = true;
             } finally {
               try { reader?.releaseLock(); } catch {}
             }
@@ -620,12 +657,15 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
             trace.push({ upstream: attempt.upstream, status: up.status, ms, note: msg.slice(0, 160) });
             if (attempt.upstream) learnUpstreamStatus(modelId, attempt.upstream, msg);
             if (!attempt.upstream && (attempt.excludeList || []).length) learnAvailableProviders(modelId, msg);
-            last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null };
+            // 判定是否值得原地重试：解析不出 JSON 错误体（空响应 / HTML 网关错误页 / 被截断）就算
+            // 「没拿到可用的上游响应」，可以重试；能解析出 JSON 错误说明上游真的回答了（400/429/5xx），
+            // 重试没有意义，直接换下一个候选。probe 阶段的失败（空流 / 读不动 / 不认识的流头）同样算。
+            last = { status: json?.error ? 502 : up.status, out: json || { error: { message: text.slice(0, 400) || netError, type: 'upstream_error' } }, routing: parseRouting(json || {}), acc, netError: null, netFail: netFail || !json };
             continue; // 错误：还未向客户端写任何字节，可切换下一候选
           }
           if (!up) {
             trace.push({ upstream: attempt.upstream, status: 502, ms, note: netError || 'no response' });
-            last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response' };
+            last = { status: 502, out: { error: { message: `upstream fetch failed: ${netError || 'no response'}`, type: 'upstream_error' } }, routing: {}, acc, netError: netError || 'no response', netFail: true };
             continue;
           }
           // 真 SSE：firstChunk 与剩余 body 串联透传（SSE 开始后无法重试）；close 钩子保留用于客户端断开时中止上游
@@ -634,7 +674,7 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
           return { status: 200, streamUp: up, streamHead: firstChunk, acc, trace, t0 };
         }
         // 非流式
-        const r = await attemptOnce(modelId, body, attempt, ctrl.signal);
+        const r = await attemptOnce(modelId, body, attempt, ctrl.signal, acc);
         const ms = Date.now() - t1;
         const note = r.netError || (r.status !== 200 ? errText(r.out?.error?.message).slice(0, 160) : 'ok');
         trace.push({ upstream: attempt.upstream, status: r.status, ms, note });
@@ -649,7 +689,29 @@ async function runChatChain(req, body, modelId, cfg, { stream = false, attemptTi
   } finally {
     if (!keepCloseHook) req.off('close', onClientClose);
   }
-  return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null };
+  // lastCtrl.signal.aborted = 这次失败是我们自己中止的（自身超时 / 客户端断开）：绝不当成可重试的网络抖动
+  return { ...last, status: last?.status ?? 502, trace, t0, netError: last?.netError || null, netFail: !!last?.netFail && !lastCtrl?.signal?.aborted };
+}
+
+// 网络层原地重试：runChatChainOnce 跑完一遍候选仍然只是「没拿到可用响应」时，
+// 退避 250→800ms（带抖动）再跑一遍；最多 2 次。候选链本身不变，客户端那边的表现
+// 就是「这次请求慢了一点点」而不是收到 502。
+// 客户端已经断开、或返回对象带 streamUp（真 SSE 已开始透传）时绝不重试。
+async function runChatChain(req, body, modelId, cfg, opts = {}) {
+  const t0 = Date.now();
+  const allTrace = [];
+  let r = null;
+  for (let round = 0; ; round++) {
+    r = await runChatChainOnce(req, body, modelId, cfg, opts);
+    allTrace.push(...(r.trace || []));
+    // 流式成功后必须把前几轮的尝试一起带上再返回，否则历史里只剩最后一次尝试、总耗时也少算
+    if (r.streamUp) return { ...r, trace: allTrace, t0 };
+    if (!r.netFail || round >= NET_RETRY_TIMES) break;
+    if (req?.socket?.destroyed) break;                      // 客户端已经走了，没必要再替它去撞上游
+    await sleep(netRetryDelayMs(round));
+    if (req?.socket?.destroyed) break;
+  }
+  return { ...r, trace: allTrace, t0 };                     // t0 用整条请求的起点，历史里的耗时才是诚实的总耗时
 }
 
 async function handleChat(req, res) {
@@ -715,7 +777,7 @@ async function handleChat(req, res) {
     src.on('error', (e) => {
       record(modelId, {
         provider: null, canonical: null, ms: Date.now() - t0, stream: true,
-        error: `stream aborted: ${e.message}`, account: acc.name,
+        error: `stream aborted: ${netReason(e)}`, account: acc.name,
         attempts: chain.trace.map((t) => t.upstream || 'auto'),
       });
       try { res.destroy(); } catch {}
