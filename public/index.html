@@ -36,6 +36,8 @@
   select, input[type=number] { background: var(--card2); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; max-width: 200px; }
   input[type=number] { width: 64px; }
   .row-actions { display: flex; gap: 6px; }
+  /* 行内小按钮：额度刷新下放到每个账号自己那一行，避免一次点击并发打多个账号 */
+  button.sm { padding: 3px 8px; font-size: 12px; }
   .result { margin-top: 12px; background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 12px; font-size: 13px; line-height: 1.8; display: none; white-space: pre-wrap; word-break: break-all; }
   .kvs { display: flex; gap: 18px; flex-wrap: wrap; margin-bottom: 8px; }
   .kvs div { font-size: 12.5px; color: var(--dim); }
@@ -144,7 +146,6 @@
       <label class="dim" style="font-size:12px"><input type="checkbox" id="accShowKeys" onchange="toggleKeyVis()"> 显示密钥</label>
       <button class="ghost" onclick="addAccountRow()">＋ 添加账号</button>
       <button onclick="saveAccounts()">保存账号配置</button>
-      <button class="ghost" onclick="refreshQuota()" id="quotaBtn">↻ 刷新额度</button>
       <span class="dim" style="font-size:12px" id="accMsg"></span>
       <span class="dim" style="font-size:12px" id="quotaMsg"></span>
     </div>
@@ -230,10 +231,12 @@ let AUTH_KEY = localStorage.getItem('cps_key') || '';
 const $ = (s) => document.querySelector(s);
 const fmt = (ts) => new Date(ts).toLocaleTimeString();
 
-async function api(path, body) {
+async function api(path, body, opts) {
   const headers = body ? { 'Content-Type': 'application/json' } : {};
   if (AUTH_KEY) headers['X-Admin-Key'] = AUTH_KEY;
-  const res = await fetch(path, body ? { method: 'POST', headers, body: JSON.stringify(body) } : { headers });
+  const init = { ...(opts || {}), headers };   // opts 目前只用于传 signal（额度刷新超时用）
+  if (body) { init.method = 'POST'; init.body = JSON.stringify(body); }
+  const res = await fetch(path, init);
   if (res.status === 401) { showLogin(); throw new Error('unauthorized'); }
   return res.json();
 }
@@ -398,10 +401,12 @@ async function loadAll() {
   renderAccounts();
   renderSecurity(sec);
   $('#noKeyBanner').style.display = meta.configured ? 'none' : 'block';
-  // 额度走异步补渲染：不阻塞首屏；若用户已经在账号表里输入，则跳过这次重渲染以免顶掉正在编辑的内容
-  loadQuota(false).then(() => {
+  // 额度走异步补渲染：先读后端缓存快照（不打上游），再逐账号串行取（命中 TTL 缓存时几乎瞬时返回）。
+  // 每个账号读回来只回填自己那一格，不整表重渲染，避免顶掉正在编辑的名称/密钥。
+  loadQuota().then(() => {
     const el = document.activeElement;
     if (!el || typeof el.closest !== 'function' || !el.closest('#accBody')) renderAccounts();
+    refreshQuotaAll(false);
   });
 }
 
@@ -703,8 +708,13 @@ const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
 // 数据来自后端 /api/quota（转发 Cline 账单接口）；按「账号名」对齐，
 // 避免增删行（未保存）时按下标错位显示成别的账号的额度。
 let QUOTA = null;
+let QUOTA_ERR = null;       // 上一次账号额度读取的失败原因（保留旧数据时用于提示）
+let QUOTA_LOADING = null;   // 逐账号刷新中的 Promise：并发调用合并成一次
+let QUOTA_PENDING = new Set();   // 正在读取的账号下标集合（对应行的额度单元格显示「读取中…」）
 const QUOTA_LABELS = { five_hour: '5小时', weekly: '本周', monthly: '本月' };
 
+// 额度一律按「账号名」对齐：行下标在本地增删行（未保存）后会与后端错位，
+// 按下标兜底就会把 A 账号的额度显示到 B 账号那行，所以对不上就显示「—」，绝不猜。
 function fmtReset(iso) {
   if (!iso) return '';
   const d = new Date(iso);
@@ -714,17 +724,23 @@ function fmtReset(iso) {
 }
 
 function renderQuotaCell(name, i) {
+  // 逐账号串行刷新：正在读的这一行显示「读取中…」，其它行保持原样
+  if (QUOTA_PENDING.has(i)) return '<span class="dim">读取中…</span>';
   if (!QUOTA) return '<span class="dim">—</span>';
-  const q = QUOTA.accounts.find((a) => a.name === name) || QUOTA.accounts[i];
+  // 缓存快照是按下标存的稀疏数组（只刷过其中几个账号时，未读的位置在 JSON 里就是 null），先挡掉空位
+  const q = QUOTA.accounts.find((a) => a && a.name === name);
   if (!q) return '<span class="dim">—</span>';
-  if (!q.ok) return `<span class="qerr" title="${escapeHtml(q.error || '读取失败')}">读取失败</span>`;
+  // 后端在读取失败时会回退到上一次成功的数据（stale=true）：继续显示旧进度，
+  // 只有从来没成功读到过（连 windows 都没有）才显示「读取失败」。
+  if (!q.ok && !Array.isArray(q.windows)) return `<span class="qerr" title="${escapeHtml(q.error || '读取失败')}">读取失败</span>`;
+  const stale = q.stale === true;
   const rows = (q.windows || []).map((w) => {
     const known = w.percent !== null && w.percent !== undefined;
     const pct = known ? Math.max(0, Math.min(100, w.percent)) : 0;
     const cls = pct >= 80 ? 'hi' : pct >= 50 ? 'mid' : '';
     const label = w.label || QUOTA_LABELS[w.type] || w.type;
     const cap = (w.limitUsd === null || w.limitUsd === undefined) ? '上限未知' : `上限 $${w.limitUsd}`;
-    const tip = `${label}：已用 ${known ? w.percent + '%' : '未知'}（${cap}${w.resetsAt ? '，重置 ' + fmtReset(w.resetsAt) : ''}）`;
+    const tip = `${label}：已用 ${known ? w.percent + '%' : '未知'}（${cap}${w.resetsAt ? '，重置 ' + fmtReset(w.resetsAt) : ''}）${stale ? '，为上次成功读取的数据' : ''}`;
     return `<div class="qwin" title="${escapeHtml(tip)}">
       <span class="qlab">${escapeHtml(label)}</span>
       <span class="qbar"><i class="${cls}" style="width:${pct}%"></i></span>
@@ -736,31 +752,97 @@ function renderQuotaCell(name, i) {
   if (q.periodStart) planParts.push(`当期 ${fmtReset(q.periodStart)} 起`);
   if (q.periodEnd) planParts.push(`${fmtReset(q.periodEnd)} 到期`);
   if (q.cancelAt) planParts.push('到期后不续费');
-  const plan = q.planName
-    ? `<div class="qplan" title="${escapeHtml(planParts.join('，'))}">${escapeHtml(q.planName)}${q.cancelAt ? ' · 到期不续费' : ''}${q.planActive === false ? ' · 已失效' : ''}</div>`
+  if (stale) {
+    const at = q.staleAt ? fmtReset(new Date(q.staleAt).toISOString()) : '';
+    planParts.push(`本次读取失败：${q.error || '未知原因'}${at ? `（数据为 ${at}）` : ''}`);
+  }
+  const plan = (q.planName || stale)
+    ? `<div class="qplan" title="${escapeHtml(planParts.join('，'))}">${q.planName ? escapeHtml(q.planName) : '上次数据'}${q.cancelAt ? ' · 到期不续费' : ''}${q.planActive === false ? ' · 已失效' : ''}${stale ? '<span class="qerr"> · 读取失败，显示上次结果</span>' : ''}</div>`
     : '';
   return rows + plan;
 }
 
-async function loadQuota(force) {
+// 首屏：只读后端缓存快照（不打上游），先把已有额度显示出来
+async function loadQuota() {
   try {
-    QUOTA = await api(`/api/quota${force ? '?refresh=1' : ''}`);
+    QUOTA = await api('/api/quota');
+    QUOTA_ERR = null;
   } catch (e) {
-    QUOTA = null;
+    // 拿不到就保留上一次的数据，而不是把整列清空成「—」
+    QUOTA_ERR = String(e?.message || e);
   }
-  const el = $('#quotaMsg');
-  if (el) el.textContent = QUOTA?.fetchedAt ? `额度更新于 ${fmt(QUOTA.fetchedAt)}` : '';
+  updateQuotaMsg();
 }
 
-async function refreshQuota() {
-  const btn = $('#quotaBtn');
-  btn.disabled = true; btn.textContent = '↻ 刷新中…';
+// 取回单个账号的额度并只回填该行：上游账单接口疑似有并发限制，所以额度一律按账号逐个取，
+// 一次点击只对应一个账号的上游请求（不整表重渲染，正在编辑的名称/密钥不会被顶掉）。
+async function fetchQuotaInto(i, force) {
+  const name = ACCS?.accounts?.[i]?.name || '';
+  QUOTA_PENDING.add(i);
+  paintQuotaCell(i, name);
   try {
-    await loadQuota(true);
-    renderAccounts();
+    // 带上账号名：后端会核对第 i 个账号是否就叫这个名字，避免本地增删行（未保存）后下标错位、取错账号的额度
+    const r = await api(`/api/quota?account=${i}&name=${encodeURIComponent(name)}${force ? '&refresh=1' : ''}`, undefined, { signal: abortAfter(30000) });
+    if (r?.account) {
+      if (!QUOTA) QUOTA = { fetchedAt: r.fetchedAt, accounts: [] };
+      QUOTA.accounts[i] = r.account;
+      if (r.fetchedAt) QUOTA.fetchedAt = r.fetchedAt;
+      QUOTA_ERR = null;
+    } else {
+      // 例如本地新加/改过但还没保存的行：后端会说明原因，照原样提示，不要静默失败
+      QUOTA_ERR = r?.error?.message || '读取失败';
+      if (QUOTA) QUOTA.accounts[i] = { name, ok: false, error: QUOTA_ERR };
+    }
+  } catch (e) {
+    QUOTA_ERR = e?.name === 'AbortError' ? '请求超时' : String(e?.message || e);
+    if (QUOTA) QUOTA.accounts[i] = { name, ok: false, error: QUOTA_ERR };
   } finally {
-    btn.disabled = false; btn.textContent = '↻ 刷新额度';
+    QUOTA_PENDING.delete(i);
+    paintQuotaCell(i, name);
+    updateQuotaMsg();
   }
+}
+
+// 行内「↻」：只刷新这一个账号
+async function refreshQuotaOne(i, btn) {
+  if (QUOTA_PENDING.has(i)) return;
+  btn.disabled = true;
+  btn.classList.add('spin');
+  try {
+    await fetchQuotaInto(i, true);
+  } finally {
+    btn.disabled = false;
+    btn.classList.remove('spin');
+  }
+}
+
+// 首屏补数：仍然逐账号串行（force=false，命中后端 TTL 缓存时几乎瞬时返回）
+async function refreshQuotaAll(force) {
+  if (QUOTA_LOADING) return QUOTA_LOADING;
+  const n = (ACCS?.accounts || []).length;
+  QUOTA_LOADING = (async () => {
+    for (let i = 0; i < n; i++) await fetchQuotaInto(i, force);
+  })().finally(() => { QUOTA_LOADING = null; });
+  return QUOTA_LOADING;
+}
+
+function abortAfter(ms) {
+  const ctrl = new AbortController();
+  setTimeout(() => ctrl.abort(), ms);
+  return ctrl.signal;
+}
+
+function paintQuotaCell(i, name) {
+  const td = document.getElementById(`quotaCell${i}`);
+  if (td) td.innerHTML = renderQuotaCell(name ?? '', i);
+}
+
+function updateQuotaMsg() {
+  const el = $('#quotaMsg');
+  if (!el) return;
+  const at = QUOTA?.fetchedAt ? `额度更新于 ${fmt(QUOTA.fetchedAt)}` : '';
+  el.textContent = QUOTA_ERR ? `${at}${at ? ' · ' : ''}本次读取失败：${QUOTA_ERR}` : at;
+  el.className = QUOTA_ERR ? 'qerr' : 'dim';
 }
 
 function renderAccounts() {
@@ -775,10 +857,11 @@ function renderAccounts() {
       <td><input class="accName" data-i="${i}" value="${escapeHtml(a.name)}" style="width:110px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-size:12.5px"></td>
       <td><input class="accKey" data-i="${i}" type="${show ? 'text' : 'password'}" value="${escapeHtml(a.key)}" style="width:100%; min-width:280px; background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:5px 8px; font-family:Consolas, monospace; font-size:12px"></td>
       <td><input type="checkbox" class="accEnabled" data-i="${i}" ${a.enabled !== false ? 'checked' : ''}></td>
-      <td>${renderQuotaCell(a.name, i)}</td>
+      <td id="quotaCell${i}">${renderQuotaCell(a.name, i)}</td>
       <td>${st.requests ?? 0}${st.lastError ? '<div class="mismatch" style="font-size:11px">最近有错误</div>' : ''}</td>
       <td class="dim" style="font-size:12px">${st.lastUsed ? fmt(st.lastUsed) : '—'}</td>
       <td><div class="row-actions">
+        <button class="ghost sm" title="刷新此账号额度" onclick="refreshQuotaOne(${i}, this)">↻</button>
         <button class="ghost" onclick="testAccount(${i}, this)">测试</button>
         <button class="ghost" onclick="delAccount(${i})">删除</button>
       </div></td>

@@ -154,7 +154,9 @@ async function fetchJSON(url, opts = {}, timeoutMs = 60000) {
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch { json = { raw: text }; }
-    return { status: res.status, json };
+    // retry-after（秒）：上游限流时会带，重试要按它等，不能自己乱猜
+    const ra = Number(res.headers?.get?.('retry-after'));
+    return { status: res.status, json, retryAfter: Number.isFinite(ra) && ra > 0 ? ra : null };
   } finally {
     clearTimeout(t);
   }
@@ -847,16 +849,70 @@ const QUOTA_WINDOWS = [
   ['monthly', '本月', 'last30daysUsageCostUSDPerUser'],
 ];
 
+// 账单接口的容错参数。与聊天请求不同，这两条接口不消耗额度、不计费，重试成本几乎为零，
+// 所以允许重试得更积极一点（实测「读取失败」绝大多数是瞬时抖动：连接超时 / 5xx / 429）。
+// 两级时间预算：单次请求 8s < 单账号（含重试）15s。整轮不再有「总预算」——
+// 额度改成逐账号串行拉取（见 quotaForAccount），每个账号各自有界，不会攒成一个长尾。
+const QUOTA_TIMEOUT_MS = 8000;          // 单次请求超时
+const QUOTA_MIN_ATTEMPT_MS = 1500;      // 剩余预算低于这个值就不再发起新尝试（免得白等一个必然超时的请求）
+const QUOTA_RETRY_TIMES = 2;            // 额外重试次数（总尝试 = 1 + 2）
+const QUOTA_RETRY_BASE_MS = 400;        // 退避基数：400ms → 800ms，带 ±40% 抖动
+const QUOTA_RETRY_MAX_MS = 3000;
+const QUOTA_ACCOUNT_BUDGET_MS = 15000;  // 单个账号一整轮（两条接口 + 重试）的预算
+const QUOTA_FALLBACK_TTL_MS = 30 * 60e3;  // 允许回退展示「上次成功数据」的宽限期
+const QUOTA_RETRY_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 520, 522, 524]);
+
+function quotaRetryDelayMs(round, retryAfterSec) {
+  if (retryAfterSec) return Math.min(8000, retryAfterSec * 1000);   // 上游给了 Retry-After 就听它的
+  const d = Math.min(QUOTA_RETRY_MAX_MS, QUOTA_RETRY_BASE_MS * 2 ** round);
+  return Math.round(d * (0.6 + Math.random() * 0.8));
+}
+
+// 带退避重试的账单请求：永不抛出，异常统一归一成 { status: 0, error }。
+// 只重试「网络层失败」与「上游临时性状态码」；拿到 401/403/404 这类确定性响应直接返回（重试没意义）。
+// 每次尝试的超时都会被「剩余预算」夹住，保证单个账号整体不超过 deadline。
+async function quotaFetch(url, headers, deadline) {
+  let lastError = null;
+  let lastResult = null;   // 最后一次拿到的上游响应：预算耗尽时原样返回，不要伪装成网络错误
+  let retryAfter = null;
+  for (let round = 0; round <= QUOTA_RETRY_TIMES; round++) {
+    const remain = deadline - Date.now();
+    if (remain < QUOTA_MIN_ATTEMPT_MS) { lastError = lastError || '读取超时'; break; }
+    if (round) {
+      const wait = quotaRetryDelayMs(round - 1, retryAfter);
+      if (Date.now() + wait >= deadline) break;
+      await sleep(wait);
+    }
+    retryAfter = null;
+    try {
+      const r = await fetchJSON(url, { headers }, Math.min(QUOTA_TIMEOUT_MS, deadline - Date.now()));
+      if (!QUOTA_RETRY_STATUS.has(r.status)) return { ...r, error: null };
+      lastResult = r;
+      retryAfter = r.retryAfter;
+      lastError = `HTTP ${r.status}`;
+    } catch (e) {
+      lastError = netReason(e);
+    }
+  }
+  if (lastResult) return { ...lastResult, error: lastError || `HTTP ${lastResult.status}` };
+  return { status: 0, json: null, retryAfter: null, error: lastError || 'upstream unreachable' };
+}
+
 async function fetchAccountQuota(key) {
   const headers = chatHeaders(key);
-  const [lim, plan] = await Promise.all([
-    fetchJSON(`${config.upstreamBase}/users/me/plan/usage-limits`, { headers }, 15000),
-    fetchJSON(`${config.upstreamBase}/users/me/plan`, { headers }, 15000),
-  ]);
+  const deadline = Date.now() + QUOTA_ACCOUNT_BUDGET_MS;
+  // 两次请求严格串行，且先取真正重要的 /usage-limits：
+  // 上游账单接口疑似有并发限制，同一账号同时发两条会互相挤掉；而且 /plan 只提供套餐名等展示字段，
+  // 一旦额度本身没取到就直接返回错误，不再浪费预算去打 /plan。
+  const lim = await quotaFetch(`${config.upstreamBase}/users/me/plan/usage-limits`, headers, deadline)
+    .catch((e) => ({ status: 0, json: null, error: netReason(e) }));
   if (lim.status !== 200 || !Array.isArray(lim.json?.data?.limits)) {
-    const raw = lim.json?.error?.message || lim.json?.error || `HTTP ${lim.status}`;
+    const raw = lim.json?.error?.message || lim.json?.error || lim.error || `HTTP ${lim.status}`;
     return { ok: false, error: String(typeof raw === 'string' ? raw : JSON.stringify(raw)).slice(0, 200) };
   }
+  // /plan 失败只是没有套餐名，绝不能连累已经拿到的额度（旧实现用裸 Promise.all 会被它整体拖成「读取失败」）
+  const plan = await quotaFetch(`${config.upstreamBase}/users/me/plan`, headers, deadline)
+    .catch((e) => ({ status: 0, json: null, error: netReason(e) }));
   const byType = {};
   for (const it of lim.json.data.limits) if (it && it.type) byType[it.type] = it;
   const planData = plan.status === 200 ? plan.json?.data : null;
@@ -884,22 +940,67 @@ async function fetchAccountQuota(key) {
   };
 }
 
-// 逐账号按 key 查自己的额度（/users/me/* 是「key 所属账号」，多账号必须逐把查），带 TTL 缓存
+// 额度缓存：按账号下标存条目，每个条目自带 at（各自计时，逐账号刷新时不必整轮失效）。
+// 1. quotaLastGood：按账号名记住上一次成功结果，偶发失败时回退展示（stale=true），
+//    避免一次网络抖动就把整行变成「读取失败」——额度是 5 小时/周/月级别的慢变量，
+//    几分钟前的数据远比一个红字有用。
+// 2. quotaQueue：全局串行队列。上游账单接口疑似有并发限制，同时打多个账号会出现随机某个账号
+//    读取失败，所以这里保证「同一时刻只有一个账号的额度请求在飞」，页面侧也是逐账号拉取。
 let quotaCache = { at: 0, accounts: [] };
-async function quotaSnapshot({ force = false } = {}) {
-  if (!force && quotaCache.accounts.length && Date.now() - quotaCache.at < QUOTA_TTL_MS) return quotaCache;
-  const list = config.accounts || [];
-  const accounts = await Promise.all(list.map(async (a, i) => {
-    const name = a?.name || `账号${i + 1}`;
-    const enabled = a?.enabled !== false;
-    if (!a?.key) return { name, enabled, ok: false, error: '未配置 key' };
-    try {
-      return { name, enabled, ...(await fetchAccountQuota(a.key)) };
-    } catch (e) {
-      return { name, enabled, ok: false, error: String(e?.message || e).slice(0, 200) };
-    }
-  }));
-  quotaCache = { at: Date.now(), accounts };
+let quotaLastGood = {};
+let quotaQueue = Promise.resolve();
+function quotaSerial(fn) {
+  const run = quotaQueue.then(fn, fn);
+  quotaQueue = run.then(() => {}, () => {});
+  return run;
+}
+
+// 取单个账号的额度（含失败回退），不加锁，由调用方保证串行
+async function quotaFetchOne(i) {
+  const a = (config.accounts || [])[i];
+  const name = a?.name || `账号${i + 1}`;
+  const enabled = a?.enabled !== false;
+  if (!a) return { name, enabled, ok: false, error: '账号不存在（账号池已变更，请刷新页面）' };
+  if (!a.key) return { name, enabled, ok: false, error: '未配置 key' };
+  let res;
+  try {
+    res = await fetchAccountQuota(a.key);
+  } catch (e) {
+    res = { ok: false, error: String(e?.message || e).slice(0, 200) };
+  }
+  if (res.ok) {
+    quotaLastGood[name] = { ...res, at: Date.now() };
+    return { name, enabled, ...res };
+  }
+  const prev = quotaLastGood[name];
+  if (prev && Date.now() - prev.at < QUOTA_FALLBACK_TTL_MS) {
+    // 回退展示上次成功的数据，并带上本次失败原因（前端据此提示，不静默糊弄）
+    return { name, enabled, ...prev, stale: true, staleAt: prev.at, error: res.error };
+  }
+  return { name, enabled, ...res };
+}
+
+// 单账号额度查询：TTL 内直接吃缓存；否则进串行队列去上游取一次并写回缓存。
+// 同一个账号在同一时刻只会有一个上游请求在飞（连点、多页面共用同一条队列）。
+async function quotaForAccount(i, { force = false } = {}) {
+  const fresh = (e) => e && e.at && Date.now() - e.at < QUOTA_TTL_MS;
+  if (!force && fresh(quotaCache.accounts[i])) return quotaCache.accounts[i];
+  const startedAt = Date.now();
+  return quotaSerial(async () => {
+    // 排队期间别人（另一个页面 / 连点）可能已经把同一个账号刷完了：
+    // 只要这条结果比本请求发起还新，就直接复用，force 刷新也不例外，避免同一轮重复打上游。
+    const cur = quotaCache.accounts[i];
+    if (cur && cur.at && cur.at >= startedAt) return cur;
+    if (!force && fresh(cur)) return cur;
+    const entry = { ...(await quotaFetchOne(i)), at: Date.now() };
+    quotaCache.accounts[i] = entry;
+    quotaCache.at = Date.now();
+    return entry;
+  });
+}
+
+// 缓存快照：只读，不打上游（真正的取数由页面逐账号调 /api/quota?account=N）
+function quotaSnapshot() {
   return quotaCache;
 }
 
@@ -973,8 +1074,25 @@ const server = http.createServer(async (req, res) => {
       });
     }
     if (req.method === 'GET' && p === '/api/quota') {
-      // refresh=1 跳过缓存（页面上的「刷新额度」按钮走这条）
-      const snap = await quotaSnapshot({ force: url.searchParams.get('refresh') === '1' });
+      // account=N：单账号额度（页面逐账号串行拉取，一次只打一个账号的上游请求）；refresh=1 跳过缓存。
+      // 页面还会带上 name：本地增删行（未保存）会让行下标与后端错位，名字对不上就直接拒绝，
+      // 免得把 A 账号的额度取回来显示到 B 账号那一行。
+      const accRaw = url.searchParams.get('account');
+      if (accRaw !== null) {
+        const i = Number(accRaw);
+        if (!Number.isInteger(i) || i < 0 || i >= (config.accounts || []).length) {
+          return sendJSON(res, 400, { error: { message: `账号下标越界：${accRaw}` } });
+        }
+        const wantName = url.searchParams.get('name');
+        const cur = config.accounts[i];
+        if (wantName !== null && wantName !== (cur.name || '')) {
+          return sendJSON(res, 409, { error: { message: `该行与已保存的账号不一致（第 ${i + 1} 个账号是「${cur.name}」），请先保存账号配置` } });
+        }
+        const account = await quotaForAccount(i, { force: url.searchParams.get('refresh') === '1' });
+        return sendJSON(res, 200, { fetchedAt: quotaCache.at, index: i, name: account.name, account });
+      }
+      // 不带参数：只读缓存快照（不打上游），用于首屏先把已有数据显示出来
+      const snap = quotaSnapshot();
       return sendJSON(res, 200, { fetchedAt: snap.at, accounts: snap.accounts });
     }
     if (req.method === 'POST' && p === '/api/accounts') {
@@ -993,6 +1111,7 @@ const server = http.createServer(async (req, res) => {
       saveConfig();
       RR_COUNTER = 0;
       quotaCache = { at: 0, accounts: [] };   // 账号池变了，额度缓存作废（否则会串号）
+      quotaLastGood = {};                     // 同上：key 可能已被换掉，旧的成功结果不能再当回退数据
       return sendJSON(res, 200, { ok: true, accounts: config.accounts.length, mode: config.accountMode, active: config.activeAccount });
     }
     if (req.method === 'POST' && p === '/api/accounts/test') {
